@@ -40,7 +40,10 @@ class AlternativeProduct(BaseModel):
     serving_size_g: float
     daily_sugar_percentage: float
     daily_sodium_percentage: float
+    score: int = 0
+    score_diff: int = 0
     why_is_better: str
+
 
 class EvaluationResponse(BaseModel):
     """Respuesta integral del motor de evaluación."""
@@ -49,6 +52,7 @@ class EvaluationResponse(BaseModel):
     brand: str
     category: str
     traffic_light: str  # "ROJO", "AMARILLO", "VERDE"
+    score: int = 0      # 0 a 100
     summary_title: str
     summary_reason: str
     risks: List[RiskFactor]
@@ -56,6 +60,7 @@ class EvaluationResponse(BaseModel):
     daily_sodium_percentage: float
     saturated_fat_per_serving: float
     alternatives: List[AlternativeProduct] = []
+    category_tips: List[str] = []
     shareable_text: str = ""
 
 class HistoryRecord(BaseModel):
