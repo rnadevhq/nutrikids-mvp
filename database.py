@@ -1,7 +1,7 @@
 import os
 import json
 import sqlite3
-from typing import List, Optional
+from typing import List, Optional, Callable, Any
 from models import ChildProfile, ProductData, HistoryRecord
 
 DB_NAME = "nutrikids.db"
@@ -14,14 +14,26 @@ else:
 
 USE_POSTGRES = DATABASE_URL.startswith("postgresql://")
 
+_pg_pool = None
+
 if USE_POSTGRES:
     import psycopg2
+    from psycopg2.pool import ThreadedConnectionPool
 
 
-def get_connection():
-    if USE_POSTGRES:
-        return psycopg2.connect(DATABASE_URL)
-    return sqlite3.connect(DB_NAME)
+def _get_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        _pg_pool = ThreadedConnectionPool(
+            minconn=1,
+            maxconn=10,
+            dsn=DATABASE_URL,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
+        )
+    return _pg_pool
 
 
 def _q(query: str) -> str:
@@ -29,17 +41,63 @@ def _q(query: str) -> str:
     return query.replace("?", "%s") if USE_POSTGRES else query
 
 
+def _execute_with_retry(operation: Callable[[Any], Any]) -> Any:
+    """Reutiliza conexiones del pool y reintenta si Neon cerró una conexión inactiva."""
+    if not USE_POSTGRES:
+        conn = sqlite3.connect(DB_NAME)
+        try:
+            result = operation(conn)
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    pool = _get_pool()
+    last_error = None
+    for attempt in range(2):
+        conn = pool.getconn()
+        broken = False
+        try:
+            if conn.closed:
+                broken = True
+                raise psycopg2.InterfaceError("Conexión cerrada por el servidor")
+            result = operation(conn)
+            conn.commit()
+            return result
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            broken = True
+            last_error = e
+            if attempt == 0:
+                continue
+            raise
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                pool.putconn(conn, close=broken or bool(conn.closed))
+            except Exception:
+                pass
+    raise last_error
+
+
 def init_db():
-    """Inicializa las 3 tablas relacionales sin datos ficticios."""
-    conn = get_connection()
-    try:
+    """Inicializa tablas, columnas de aislamiento por dispositivo e índices."""
+    def _op(conn):
         cursor = conn.cursor()
         pk_auto = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
 
-        # 1. Tabla de Perfiles
+        # 1. Tabla de Perfiles (aislada por device_id)
         cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS profiles (
                 id {pk_auto},
+                device_id TEXT NOT NULL DEFAULT 'legacy',
                 name TEXT NOT NULL,
                 age_years INTEGER NOT NULL,
                 allergies TEXT NOT NULL,
@@ -48,7 +106,7 @@ def init_db():
             )
         """)
 
-        # 2. Tabla de Catálogo de Productos
+        # 2. Tabla de Catálogo de Productos (compartida globalmente)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 barcode TEXT PRIMARY KEY,
@@ -67,24 +125,11 @@ def init_db():
             )
         """)
 
-        # Migración segura si ya existía la tabla sin las columnas nuevas
-        if USE_POSTGRES:
-            cursor.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual'")
-            cursor.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS is_verified BOOLEAN NOT NULL DEFAULT FALSE")
-        else:
-            for col_sql in [
-                "ALTER TABLE products ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
-                "ALTER TABLE products ADD COLUMN is_verified BOOLEAN NOT NULL DEFAULT FALSE",
-            ]:
-                try:
-                    cursor.execute(col_sql)
-                except sqlite3.OperationalError:
-                    pass
-
-        # 3. Tabla de Historial de Escaneos / Evaluaciones
+        # 3. Tabla de Historial (aislada por device_id)
         cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS scan_history (
                 id {pk_auto},
+                device_id TEXT NOT NULL DEFAULT 'legacy',
                 profile_id INTEGER NOT NULL,
                 profile_name TEXT NOT NULL,
                 barcode TEXT NOT NULL,
@@ -96,20 +141,45 @@ def init_db():
             )
         """)
 
-        conn.commit()
-    finally:
-        conn.close()
+        # Migraciones seguras sobre tablas existentes
+        if USE_POSTGRES:
+            cursor.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS device_id TEXT NOT NULL DEFAULT 'legacy'")
+            cursor.execute("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS device_id TEXT NOT NULL DEFAULT 'legacy'")
+            cursor.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'manual'")
+            cursor.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS is_verified BOOLEAN NOT NULL DEFAULT FALSE")
+        else:
+            for col_sql in [
+                "ALTER TABLE profiles ADD COLUMN device_id TEXT NOT NULL DEFAULT 'legacy'",
+                "ALTER TABLE scan_history ADD COLUMN device_id TEXT NOT NULL DEFAULT 'legacy'",
+                "ALTER TABLE products ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
+                "ALTER TABLE products ADD COLUMN is_verified BOOLEAN NOT NULL DEFAULT FALSE",
+            ]:
+                try:
+                    cursor.execute(col_sql)
+                except sqlite3.OperationalError:
+                    pass
+
+        # Índices para consultas rápidas al escalar
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_profiles_device_id ON profiles (device_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_history_device_profile ON scan_history (device_id, profile_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_products_cat_verified ON products (category, is_verified)")
+
+    _execute_with_retry(_op)
 
 
-# --- CRUD DE PERFILES ---
-def get_all_profiles() -> List[ChildProfile]:
-    conn = get_connection()
-    try:
+# --- CRUD DE PERFILES (AISLADO POR DEVICE_ID) ---
+def get_all_profiles(device_id: str) -> List[ChildProfile]:
+    def _op(conn):
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT id, name, age_years, allergies, avoid_sweeteners, avoid_artificial_colors
-            FROM profiles ORDER BY id ASC
-        """)
+        cursor.execute(
+            _q("""
+                SELECT id, name, age_years, allergies, avoid_sweeteners, avoid_artificial_colors
+                FROM profiles
+                WHERE device_id = ?
+                ORDER BY id ASC
+            """),
+            (device_id,),
+        )
         rows = cursor.fetchall()
         return [
             ChildProfile(
@@ -122,24 +192,24 @@ def get_all_profiles() -> List[ChildProfile]:
             )
             for r in rows
         ]
-    finally:
-        conn.close()
+
+    return _execute_with_retry(_op)
 
 
-def save_profile(profile: ChildProfile) -> ChildProfile:
-    conn = get_connection()
-    try:
+def save_profile(profile: ChildProfile, device_id: str) -> ChildProfile:
+    def _op(conn):
         cursor = conn.cursor()
         allergies_json = json.dumps(profile.allergies)
         if profile.id is None:
             if USE_POSTGRES:
                 cursor.execute(
                     """
-                    INSERT INTO profiles (name, age_years, allergies, avoid_sweeteners, avoid_artificial_colors)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO profiles (device_id, name, age_years, allergies, avoid_sweeteners, avoid_artificial_colors)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
+                        device_id,
                         profile.name,
                         profile.age_years,
                         allergies_json,
@@ -151,10 +221,11 @@ def save_profile(profile: ChildProfile) -> ChildProfile:
             else:
                 cursor.execute(
                     """
-                    INSERT INTO profiles (name, age_years, allergies, avoid_sweeteners, avoid_artificial_colors)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO profiles (device_id, name, age_years, allergies, avoid_sweeteners, avoid_artificial_colors)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        device_id,
                         profile.name,
                         profile.age_years,
                         allergies_json,
@@ -168,7 +239,7 @@ def save_profile(profile: ChildProfile) -> ChildProfile:
                 _q("""
                     UPDATE profiles
                     SET name = ?, age_years = ?, allergies = ?, avoid_sweeteners = ?, avoid_artificial_colors = ?
-                    WHERE id = ?
+                    WHERE id = ? AND device_id = ?
                 """),
                 (
                     profile.name,
@@ -177,25 +248,30 @@ def save_profile(profile: ChildProfile) -> ChildProfile:
                     bool(profile.avoid_sweeteners),
                     bool(profile.avoid_artificial_colors),
                     profile.id,
+                    device_id,
                 ),
             )
-        conn.commit()
         return profile
-    finally:
-        conn.close()
+
+    return _execute_with_retry(_op)
 
 
-def delete_profile(profile_id: int):
-    conn = get_connection()
-    try:
+def delete_profile(profile_id: int, device_id: str):
+    def _op(conn):
         cursor = conn.cursor()
-        cursor.execute(_q("DELETE FROM profiles WHERE id = ?"), (profile_id,))
-        conn.commit()
-    finally:
-        conn.close()
+        cursor.execute(
+            _q("DELETE FROM scan_history WHERE profile_id = ? AND device_id = ?"),
+            (profile_id, device_id),
+        )
+        cursor.execute(
+            _q("DELETE FROM profiles WHERE id = ? AND device_id = ?"),
+            (profile_id, device_id),
+        )
+
+    _execute_with_retry(_op)
 
 
-# --- CRUD DE PRODUCTOS Y CATÁLOGO ---
+# --- CRUD DE PRODUCTOS Y CATÁLOGO (GLOBAL) ---
 PRODUCT_SELECT_COLS = """
     barcode, name, brand, category, ingredients_text, allergens_tags,
     sugars_100g, sodium_mg_100g, saturated_fat_100g, serving_size_g,
@@ -221,9 +297,7 @@ def _row_to_product(r) -> ProductData:
 
 
 def save_product_to_db(product: ProductData):
-    """Guarda o actualiza un producto en la base de datos."""
-    conn = get_connection()
-    try:
+    def _op(conn):
         cursor = conn.cursor()
         cursor.execute(
             _q("""
@@ -262,14 +336,12 @@ def save_product_to_db(product: ProductData):
                 bool(product.is_verified),
             ),
         )
-        conn.commit()
-    finally:
-        conn.close()
+
+    _execute_with_retry(_op)
 
 
 def get_product_from_db(barcode: str) -> Optional[ProductData]:
-    conn = get_connection()
-    try:
+    def _op(conn):
         cursor = conn.cursor()
         cursor.execute(
             _q(f"SELECT {PRODUCT_SELECT_COLS} FROM products WHERE barcode = ?"),
@@ -277,25 +349,22 @@ def get_product_from_db(barcode: str) -> Optional[ProductData]:
         )
         row = cursor.fetchone()
         return _row_to_product(row) if row else None
-    finally:
-        conn.close()
+
+    return _execute_with_retry(_op)
 
 
 def get_all_products_from_db() -> List[ProductData]:
-    conn = get_connection()
-    try:
+    def _op(conn):
         cursor = conn.cursor()
         cursor.execute(f"SELECT {PRODUCT_SELECT_COLS} FROM products ORDER BY category, name ASC")
         rows = cursor.fetchall()
         return [_row_to_product(r) for r in rows]
-    finally:
-        conn.close()
+
+    return _execute_with_retry(_op)
 
 
 def search_products_in_db(query: str) -> List[ProductData]:
-    """Busca productos por coincidencia insensible a mayúsculas en nombre, marca o EAN."""
-    conn = get_connection()
-    try:
+    def _op(conn):
         cursor = conn.cursor()
         q = f"%{query.strip()}%"
         cursor.execute(
@@ -311,8 +380,8 @@ def search_products_in_db(query: str) -> List[ProductData]:
         )
         rows = cursor.fetchall()
         return [_row_to_product(r) for r in rows]
-    finally:
-        conn.close()
+
+    return _execute_with_retry(_op)
 
 
 def get_products_by_category_from_db(
@@ -320,9 +389,7 @@ def get_products_by_category_from_db(
     exclude_barcode: str,
     only_verified: bool = True,
 ) -> List[ProductData]:
-    """Obtiene candidatos de la misma categoría; por defecto solo verificados para recomendaciones seguras."""
-    conn = get_connection()
-    try:
+    def _op(conn):
         cursor = conn.cursor()
         if only_verified:
             cursor.execute(
@@ -344,21 +411,29 @@ def get_products_by_category_from_db(
             )
         rows = cursor.fetchall()
         return [_row_to_product(r) for r in rows]
-    finally:
-        conn.close()
+
+    return _execute_with_retry(_op)
 
 
-# --- CRUD DE HISTORIAL DE EVALUACIONES ---
-def add_scan_history(profile: ChildProfile, product: ProductData, traffic_light: str, summary_reason: str):
-    conn = get_connection()
-    try:
+# --- CRUD DE HISTORIAL (AISLADO POR DEVICE_ID) ---
+def add_scan_history(
+    profile: ChildProfile,
+    product: ProductData,
+    traffic_light: str,
+    summary_reason: str,
+    device_id: str,
+):
+    def _op(conn):
         cursor = conn.cursor()
         cursor.execute(
             _q("""
-                INSERT INTO scan_history (profile_id, profile_name, barcode, product_name, brand, traffic_light, summary_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO scan_history (
+                    device_id, profile_id, profile_name, barcode, product_name, brand, traffic_light, summary_reason
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """),
             (
+                device_id,
                 profile.id or 0,
                 profile.name,
                 product.barcode,
@@ -368,30 +443,36 @@ def add_scan_history(profile: ChildProfile, product: ProductData, traffic_light:
                 summary_reason,
             ),
         )
-        conn.commit()
-    finally:
-        conn.close()
+
+    _execute_with_retry(_op)
 
 
-def get_scan_history(profile_id: Optional[int] = None, limit: int = 30) -> List[HistoryRecord]:
-    conn = get_connection()
-    try:
+def get_scan_history(
+    device_id: str,
+    profile_id: Optional[int] = None,
+    limit: int = 30,
+) -> List[HistoryRecord]:
+    def _op(conn):
         cursor = conn.cursor()
         if profile_id is not None:
             cursor.execute(
                 _q("""
                     SELECT id, profile_id, profile_name, barcode, product_name, brand, traffic_light, summary_reason, scanned_at
-                    FROM scan_history WHERE profile_id = ? ORDER BY id DESC LIMIT ?
+                    FROM scan_history
+                    WHERE device_id = ? AND profile_id = ?
+                    ORDER BY id DESC LIMIT ?
                 """),
-                (profile_id, limit),
+                (device_id, profile_id, limit),
             )
         else:
             cursor.execute(
                 _q("""
                     SELECT id, profile_id, profile_name, barcode, product_name, brand, traffic_light, summary_reason, scanned_at
-                    FROM scan_history ORDER BY id DESC LIMIT ?
+                    FROM scan_history
+                    WHERE device_id = ?
+                    ORDER BY id DESC LIMIT ?
                 """),
-                (limit,),
+                (device_id, limit),
             )
         rows = cursor.fetchall()
         return [
@@ -408,18 +489,22 @@ def get_scan_history(profile_id: Optional[int] = None, limit: int = 30) -> List[
             )
             for r in rows
         ]
-    finally:
-        conn.close()
+
+    return _execute_with_retry(_op)
 
 
-def clear_scan_history(profile_id: Optional[int] = None):
-    conn = get_connection()
-    try:
+def clear_scan_history(device_id: str, profile_id: Optional[int] = None):
+    def _op(conn):
         cursor = conn.cursor()
         if profile_id is not None:
-            cursor.execute(_q("DELETE FROM scan_history WHERE profile_id = ?"), (profile_id,))
+            cursor.execute(
+                _q("DELETE FROM scan_history WHERE device_id = ? AND profile_id = ?"),
+                (device_id, profile_id),
+            )
         else:
-            cursor.execute("DELETE FROM scan_history")
-        conn.commit()
-    finally:
-        conn.close()
+            cursor.execute(
+                _q("DELETE FROM scan_history WHERE device_id = ?"),
+                (device_id,),
+            )
+
+    _execute_with_retry(_op)
