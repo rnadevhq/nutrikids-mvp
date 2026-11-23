@@ -22,6 +22,8 @@ class ProductData(BaseModel):
     sodium_mg_100g: float = 0.0
     saturated_fat_100g: float = 0.0
     serving_size_g: float = 100.0
+    source: str = "manual"        # "curated", "openfoodfacts", "manual"
+    is_verified: bool = False     # True solo para catálogo curado/verificado
 
 class RiskFactor(BaseModel):
     """Detalle individual de un ingrediente o nutriente riesgoso."""
